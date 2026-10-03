@@ -17,52 +17,86 @@ private let authHosts: Set<String> = [
 // X's timeline lays out tall media with an inline `aspect-ratio` on a stretched
 // flex item. WebKit here computes the item's height as "used but not definite",
 // so the width collapses to ~1px (the media becomes a thin vertical sliver).
-// This runs after the DOM is ready and gives such containers a min-width derived
-// from their height and ratio. It never overrides globals, so it is safe.
+//
+// This only inspects elements that X newly inserts, batches all layout reads and
+// writes into a single animation frame (read-all then write-all) to avoid layout
+// thrashing, and marks fixed nodes so they are never measured twice. It does not
+// override any globals, poll, or observe attribute changes.
 private let fixupJS = """
     (function () {
         if (window.__xmacFixup) { return; }
         window.__xmacFixup = true;
 
         function ratioOf(el) {
-            var ar = getComputedStyle(el).aspectRatio;
-            if (!ar || ar === 'auto') { return 0; }
-            var parts = ar.split('/');
-            var w = parseFloat(parts[0]);
-            var h = parts[1] ? parseFloat(parts[1]) : 1;
-            if (!w || !h) { return 0; }
-            return w / h;
+            var s = el.style && el.style.aspectRatio;
+            if (!s) { return 0; }
+            var p = s.split('/');
+            var w = parseFloat(p[0]);
+            var h = p[1] ? parseFloat(p[1]) : 1;
+            return (w && h) ? w / h : 0;
         }
 
-        function fix() {
-            var els = document.querySelectorAll('[style*="aspect-ratio"]');
-            for (var i = 0; i < els.length; i++) {
-                var el = els[i];
+        var pending = new Set();
+        var scheduled = false;
+
+        function flush() {
+            scheduled = false;
+            if (pending.size === 0) { return; }
+            var items = Array.from(pending);
+            pending.clear();
+
+            // Phase 1: read layout for everything at once.
+            var work = [];
+            for (var i = 0; i < items.length; i++) {
+                var el = items[i];
+                if (el.__xmacFixed || !el.style || !el.style.aspectRatio) { continue; }
                 var r = el.getBoundingClientRect();
-                if (r.width >= 8 || r.height < 40) { continue; }
-                var ratio = ratioOf(el);
+                if (r.width < 8 && r.height >= 40) { work.push([el, r.height]); }
+            }
+            // Phase 2: apply all writes.
+            for (var k = 0; k < work.length; k++) {
+                var node = work[k][0];
+                var ratio = ratioOf(node);
                 if (ratio <= 0) { continue; }
-                var target = Math.round(r.height * ratio);
-                if (target > 8 && el.style.minWidth !== target + 'px') {
-                    el.style.minWidth = target + 'px';
+                var target = Math.round(work[k][1] * ratio);
+                if (target > 8) {
+                    node.style.minWidth = target + 'px';
+                    node.__xmacFixed = true;
                 }
             }
         }
 
-        var scheduled = false;
         function schedule() {
             if (scheduled) { return; }
             scheduled = true;
-            setTimeout(function () { scheduled = false; fix(); }, 50);
+            requestAnimationFrame(flush);
+        }
+
+        function scan(root) {
+            if (!root) { return; }
+            if (root.nodeType === 1) {
+                if (root.matches && root.matches('[style*="aspect-ratio"]')) { pending.add(root); }
+                if (root.querySelectorAll) {
+                    var els = root.querySelectorAll('[style*="aspect-ratio"]');
+                    for (var i = 0; i < els.length; i++) { pending.add(els[i]); }
+                }
+            } else if (root.nodeType === 11) {
+                var nodes = root.childNodes;
+                for (var j = 0; j < nodes.length; j++) { scan(nodes[j]); }
+            }
+            schedule();
         }
 
         function start() {
-            fix();
+            scan(document.body);
             try {
-                new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+                new MutationObserver(function (mutations) {
+                    for (var i = 0; i < mutations.length; i++) {
+                        var added = mutations[i].addedNodes;
+                        for (var j = 0; j < added.length; j++) { scan(added[j]); }
+                    }
+                }).observe(document.body, { childList: true, subtree: true });
             } catch (_) {}
-            window.addEventListener('resize', schedule);
-            setInterval(fix, 2000);
         }
 
         if (document.readyState === 'loading') {
@@ -237,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     WKDownloadDelegate, NSToolbarDelegate, NSSearchFieldDelegate
 {
     private let defaults = UserDefaults.standard
+    private let debugEnabled = ProcessInfo.processInfo.environment["XMAC_DEBUG"] != nil
 
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -255,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var pendingURL: URL?
 
     private func dbg(_ message: @autoclosure () -> String) {
-        guard ProcessInfo.processInfo.environment["XMAC_DEBUG"] != nil else { return }
+        guard debugEnabled else { return }
         let line = "[\(Date())] \(message())\n"
         let url = URL(fileURLWithPath: "/tmp/xmac_debug.log")
         if let handle = try? FileHandle(forWritingTo: url) {
@@ -298,8 +333,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.addUserScript(
-            WKUserScript(source: fixupJS, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        if ProcessInfo.processInfo.environment["XMAC_DEBUG"] != nil {
+            WKUserScript(source: fixupJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        if debugEnabled {
             configuration.userContentController.addUserScript(
                 WKUserScript(source: debugJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -364,7 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         observations.append(
             webView.observe(\.title, options: [.new]) { [weak self] webView, _ in
                 guard let self = self else { return }
-                self.window.title = "X"
+                if self.window.title != "X" { self.window.title = "X" }
                 self.updateDockBadge(from: webView.title)
             })
         observations.append(
@@ -963,12 +998,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         dbg("didFinish url=\(webView.url?.absoluteString ?? "nil")")
-        webView.pageZoom = savedZoom
+        if abs(webView.pageZoom - savedZoom) > 0.001 {
+            webView.pageZoom = savedZoom
+        }
         scheduleDebugProbe(webView)
     }
 
     private func scheduleDebugProbe(_ webView: WKWebView) {
-        guard ProcessInfo.processInfo.environment["XMAC_DEBUG"] != nil else { return }
+        guard debugEnabled else { return }
         let body = """
             (function(){
               var c = document.createElement('div');
