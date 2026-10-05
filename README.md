@@ -106,5 +106,5 @@ XMac/
 ## 说明
 
 - 这是对网页版的封装，账号体系、内容与官方页面完全一致。
-- 数据保存在 `~/Library/WebKit/com.local.xmac/`，删除该目录即可退出所有登录。
+- 数据保存在 `~/Library/WebKit/com.atebits.Tweetie2/`，删除该目录即可退出所有登录。
 - 修改 Bundle ID、应用名或版本：见 `build_macos.sh` 顶部变量与 `Resources/Info.plist`。
